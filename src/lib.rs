@@ -1,6 +1,16 @@
-use std::thread::{self, JoinHandle};
+use std::thread;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+
 pub struct ThreadPool {
     workers: Vec<Worker>,
+    sender: mpsc::Sender<Message>,
+}
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+enum Message {
+    NewJob(Job),
+    Terminate,
 }
 
 impl ThreadPool {
@@ -13,28 +23,66 @@ impl ThreadPool {
     /// The `new` function will panic if the size is zero.
     pub fn new(size: usize) -> ThreadPool {
         assert!(size > 0);
+
+        let (sender, receiver) = mpsc::channel();
+        let receiver = Arc::new(Mutex::new(receiver));
         let mut workers = Vec::with_capacity(size);
         for i in 0..size {
-            workers.push(Worker::new(i));
+            workers.push(Worker::new(i, Arc::clone(&receiver)));
+            println!("Creating worker {}", i);
         }
-        ThreadPool { workers }
+        ThreadPool { workers, sender}
     }
 
     pub fn execute<F>(&self, f: F) 
         where
         F: FnOnce() + Send + 'static,
     {
+        let job = Box::new(f);
+        self.sender.send(Message::NewJob(job)).expect("Err: couldn't send job");
+    }
+}
+
+
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        println!("Sending Terminate messages to all workers");
+        for _ in &self.workers {
+            self.sender.send(Message::Terminate).unwrap();
+        }
+
+        for worker in &mut self.workers {
+            println!("Shutting down worker {}", worker.id);
+            if let Some(thread) = worker.thread.take() {
+                thread.join().expect("Couldn't join thread");
+            }
+        }
     }
 }
 
 pub struct Worker {
     id: usize,
-    thread: thread::JoinHandle<()>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Worker {
-    fn new(id: usize) -> Worker {
-        let thread = thread::spawn(|| {});
-        Worker {id, thread}
+    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Message>>>) -> Worker {
+        let thread = thread::spawn( move || loop {
+
+            let message = receiver.lock().expect("couldn't acquire lock!").recv().unwrap();
+            match message {
+                Message::NewJob(job) => {
+                    println!("Worker {} got a job. executing.", id);
+                    job();
+                }
+                Message::Terminate => {
+                    println!("Worker {} was asked to terminate", id);
+                    break;
+                }
+
+            }
+        });
+        Worker { id, thread: Some(thread) }
     }
 }
